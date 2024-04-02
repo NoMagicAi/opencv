@@ -2788,6 +2788,7 @@ bool CvVideoWriter_FFMPEG::open( const char * filename, int fourcc,
     CV_CODEC_ID codec_id = CV_CODEC(CODEC_ID_NONE);
     AVPixelFormat codec_pix_fmt;
     double bitrate_scale = 1;
+    double bitrate, bitrate_avg = 0, bitrate_max = 0;
 
     close();
 
@@ -2829,6 +2830,29 @@ bool CvVideoWriter_FFMPEG::open( const char * filename, int fourcc,
     }
     if (params.has(VIDEOWRITER_PROP_HW_ACCELERATION_USE_OPENCL)) {
         use_opencl = params.get<int>(VIDEOWRITER_PROP_HW_ACCELERATION_USE_OPENCL);
+    }
+    if (params.has(VIDEOWRITER_PROP_AVG_BITRATE)) {
+        // User specified average bitrate. Multiply by 1000 to get bits/s.
+        bitrate_avg = 1000 * params.get<double>(VIDEOWRITER_PROP_AVG_BITRATE);
+    }
+    if (params.has(VIDEOWRITER_PROP_MAX_BITRATE)) {
+        // User specified maximum bitrate. Multiply by 1000 to get bits/s.
+        bitrate_max = 1000 * params.get<double>(VIDEOWRITER_PROP_MAX_BITRATE);
+    }
+    if (bitrate_avg == 0 && bitrate_max == 0) {
+        bitrate = std::min(bitrate_scale*fps*width*height, (double)INT_MAX/2);
+    } else {
+        if (bitrate_avg == 0) {
+            bitrate_avg = (2 / 3) * bitrate_max;
+        }
+        if (bitrate_max == 0) {
+            bitrate_max = (3 / 2) * bitrate_avg;
+        }
+        if (bitrate_max < bitrate_avg) {
+            CV_LOG_ERROR(NULL, "VIDEOIO/FFMPEG: maximum bitrate is less than average bitrate. Bailout");
+            return false;
+        }
+        bitrate = bitrate_avg;
     }
 
     if (params.warnUnusedParameters())
@@ -3071,8 +3095,6 @@ bool CvVideoWriter_FFMPEG::open( const char * filename, int fourcc,
         break;
     }
 
-    double bitrate = std::min(bitrate_scale*fps*width*height, (double)INT_MAX/2);
-
     if (codec_id == AV_CODEC_ID_NONE) {
         codec_id = av_guess_codec(oc->oformat, NULL, filename, NULL, AVMEDIA_TYPE_VIDEO);
     }
@@ -3175,11 +3197,18 @@ bool CvVideoWriter_FFMPEG::open( const char * filename, int fourcc,
 #endif
         }
 
-        int64_t lbit_rate = (int64_t) context->bit_rate;
-        lbit_rate += (int64_t)(bitrate / 2);
-        lbit_rate = std::min(lbit_rate, (int64_t) INT_MAX);
-        context->bit_rate_tolerance = (int) lbit_rate;
-        context->bit_rate = (int) lbit_rate;
+
+        if (bitrate_avg == 0 && bitrate_max == 0) {
+            int64_t lbit_rate = (int64_t) context->bit_rate;
+            lbit_rate += (int64_t)(bitrate / 2);
+            lbit_rate = std::min(lbit_rate, (int64_t) INT_MAX);
+            context->bit_rate_tolerance = (int) lbit_rate;
+            context->bit_rate = (int) lbit_rate;
+        } else {
+            context->bit_rate_tolerance = std::min(static_cast<int64_t>(bitrate_max - bitrate_avg),
+                                                   static_cast<int64_t>(std::numeric_limits<int>::max()));
+            context->bit_rate = static_cast<int>(bitrate_avg);
+        }
 
         /* open the codec */
         err = !encode_video ? 0 : avcodec_open2(context, codec, NULL);
